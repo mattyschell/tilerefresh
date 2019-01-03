@@ -1,0 +1,9 @@
+SET SERVEROUTPUT ON;
+SET DEFINE OFF;
+@src/TEST_GISLAYER.pks;
+@src/TEST_GISLAYER.pkb;
+@src/TEST_TILEREFRESH.pks;
+@src/TEST_TILEREFRESH.pkb;
+EXEC DBMS_UTILITY.compile_schema(schema => USER);
+/
+exit

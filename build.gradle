@@ -1,0 +1,62 @@
+class deployDbScript extends DefaultTask {
+    String database
+    String password
+    String username
+    String scriptfile
+
+    @TaskAction
+    void callSqlplus() {
+        if (scriptfile) {
+            def sqlplusCmd1 = "sqlplus $username/$password@$database @$scriptfile".execute()
+                sqlplusCmd1.in.eachLine { line -> println line}
+        }
+    }
+}
+
+task compileDb ( type : deployDbScript ) {
+    group 'Deploy'
+    description 'compile database classes and packages'
+    database db
+    password pw
+    username schema
+    //how to pass in a list?
+    scriptfile 'src/compiledb.sql'
+}
+
+
+task compileDbUnitTests ( type: deployDbScript ) {
+    group 'Deploy'
+    description 'compile database package tests'
+    database db
+    password pw
+    username schema
+    scriptfile 'src/compileunittests.sql'
+}
+
+task runUnitTests ( type: deployDbScript ) {
+    group 'Deploy'
+    description 'compile everything and run all unit tests'
+    database db
+    password pw
+    username schema
+    scriptfile 'src/rununittests.sql'
+}
+
+task createParamTables ( type: deployDbScript ) {
+    group 'Deploy'
+    description 'create empty parameter tables if they dont exist'
+    database db
+    password pw
+    username schema
+    scriptfile 'src/createtables.sql'
+}
+
+
+createParamTables.dependsOn compileDb
+runUnitTests.dependsOn compileDbUnitTests
+compileDbUnitTests.dependsOn compileDb
+
+
+//-D is system properties
+//these are project properties, -Ps
+// gradlew -Pdb=GISCMNT.DOITT.NYCNET -Ppw=iluvdoitt247 -Pschema=MSCHELL runUnitTests
