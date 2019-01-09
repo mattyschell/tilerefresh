@@ -1,7 +1,6 @@
 CREATE OR REPLACE PACKAGE BODY TILEREFRESH
 AS
 
-   --mschell! 20170608
 
    PROCEDURE CREATE_TRPARAMS (
       p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_PARAMS',
@@ -58,7 +57,7 @@ AS
       p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDS',
       p_replace         IN VARCHAR2 DEFAULT 'N',
       p_srid            IN NUMBER DEFAULT 3857,
-      p_tolerance       IN NUMBER DEFAULT .0001     
+      p_tolerance       IN NUMBER DEFAULT .0001
    )
    AS
 
@@ -120,7 +119,7 @@ AS
            || 'END; ';
 
       EXECUTE IMMEDIATE psql;
-      
+
       TILEREFRESH.add_spatial_index(p_tabname,
                                     'SHAPE',
                                     p_srid,
@@ -144,6 +143,25 @@ AS
       EXECUTE IMMEDIATE 'DROP SEQUENCE ' || p_tabname || 'SEQ ';
 
    END DROP_TRSEEDS;
+
+    PROCEDURE TUNE_TRSEEDS (
+       p_tabname    IN VARCHAR DEFAULT 'TILEREFRESH_SEEDS'
+    )
+    AS
+
+        --tilerefresh_seeds gets fragmented after hundreds of thousands
+        --   of records get dissolved, often several times
+        --intent is to call this from a gradle task 
+
+    BEGIN
+
+        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' ENABLE ROW MOVEMENT';
+
+        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' SHRINK SPACE COMPACT';
+
+        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' SHRINK SPACE';
+
+    END TUNE_TRSEEDS;
 
 
    FUNCTION GET_TRPARAMS (
@@ -183,8 +201,8 @@ AS
       RETURN output;
 
    END GET_TRPARAMS;
-   
-   
+
+
    FUNCTION DUMPDIFFSSDO (
       p_tab1            IN VARCHAR2,
       p_tab2            IN VARCHAR2,
@@ -209,7 +227,7 @@ AS
       --                               'objectid',
       --                               'doitt_id',
       --                               3857)) t
-      
+
       --sample SQL fully expanded and pulled out as x1,y1,x2,y2 looks something like:
       --
       --SELECT sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
@@ -271,7 +289,7 @@ AS
       IF verbose = 1
       THEN
          dbms_output.put_line (psql1 || p_tab2 || psql2 || psql3);
-         dbms_output.put_line('using ' || p_srid || ',' || p_tab2 || ',' || 
+         dbms_output.put_line('using ' || p_srid || ',' || p_tab2 || ',' ||
                               p_synthkey || ',' || p_businesskey || ',' ||
                               p_tab1 || ',' ||  p_synthkey|| ',' ||  p_businesskey || ',' ||
                               p_cols);
@@ -332,12 +350,12 @@ AS
       THEN
          dbms_output.put_line('dumpdiffs sdo part 2');
          dbms_output.put_line (psql1 || p_tab1 || psql2 || psql3);
-         dbms_output.put_line('using ' || p_srid || ',' || p_tab1 || ',' || 
+         dbms_output.put_line('using ' || p_srid || ',' || p_tab1 || ',' ||
                               p_synthkey || ',' || p_businesskey || ',' ||
                               p_tab2 || ',' ||  p_synthkey|| ',' ||  p_businesskey || ',' ||
                               p_cols);
       END IF;
-      
+
       IF p_cols IS NULL
       THEN
 
@@ -407,64 +425,81 @@ AS
    AS
 
      --mschell! 20170609
-     --this is a wrapper for MBRs to push into a table
+     --this is a wrapper to push MBRs into a table
      --it wraps DUMPDIFFSSDO which is the core MBR-producing code
 
      --CALL tilerefresh.DUMPCALLS('BASEMAP',
      --                           'centerline');
 
-     output          TRSEEDS_REC;
-     params          TRPARAMS_REC;
-     seedcall        VARCHAR2(4000);
-     my_cursor       SYS_REFCURSOR;
-     psql            VARCHAR2(4000);
-     somembrs        TILEREFRESH.stringarray;
-     someseqs        TILEREFRESH.stringarray;
+     params             TRPARAMS_REC;
+     my_cursor          SYS_REFCURSOR;
+     psql               VARCHAR2(4000);
+     isql               VARCHAR2(4000);
+     someids            tilerefresh.stringarray;
+     somembrs           MDSYS.SDO_GEOMETRY_ARRAY := MDSYS.SDO_GEOMETRY_ARRAY();
 
    BEGIN
 
-      params := TILEREFRESH.GET_TRPARAMS(p_project_name,
-                                         p_layer_name,
-                                         p_params);
+        params := TILEREFRESH.GET_TRPARAMS(p_project_name,
+                                           p_layer_name,
+                                           p_params);
 
-      output.project_name := params.project_name;
-      output.layer_name := params.layer_name;
+        psql := 'SELECT'
+             || ' ' || p_sequence || '.NEXTVAL' 
+             || ', t.mbr'
+             || ' FROM'
+             || ' TABLE(tilerefresh.DUMPDIFFSSDO(:p1,:p2,:p3,:p4,:p5,:p6,:p7)) t';
 
-      psql := 'INSERT INTO ' || p_seedtab || ' '
-           || '(seedid, project_name, layer_name, shape) '
-           || 'SELECT ' 
-           || p_sequence || '.NEXTVAL, '
-           || ':p1, '
-           || ':p2, '
-           || 't.mbr '
-           || 'FROM '
-           || 'TABLE(tilerefresh.DUMPDIFFSSDO(:p3,:p4,:p5,:p6,:p7,:p8,:p9)) t';
-      
-      EXECUTE IMMEDIATE psql USING output.project_name,
-                                   output.layer_name,
-                                   params.table1,
-                                   params.table2,
-                                   params.synthkey,
-                                   params.businesskey,
-                                   params.srid,
-                                   p_tolerance,
-                                   params.cols;
-                                   
-      COMMIT;
-      
+         OPEN my_cursor FOR psql USING params.table1
+                                      ,params.table2
+                                      ,params.synthkey
+                                      ,params.businesskey
+                                      ,params.srid
+                                      ,p_tolerance
+                                      ,params.cols;
+
+        LOOP
+
+            --rationale for sys_refcursor and commits in chunks of 50:
+            --I was running out of undo on bulk inserts
+            --could be due to other unrelated ETLS running, not sure
+
+            FETCH my_cursor BULK COLLECT INTO someids
+                                             ,somembrs LIMIT 50;
+
+            EXIT WHEN someids.COUNT = 0;
+
+                isql := 'INSERT INTO ' || p_seedtab || ' '
+                     || '(seedid, project_name, layer_name, shape) '
+                     || 'VALUES '
+                     || '(:p1,:p2,:p3,:p4)';
+
+                FORALL ii in 1 .. someids.COUNT
+                    EXECUTE IMMEDIATE isql USING someids(ii)
+                                                ,params.project_name
+                                                ,params.layer_name
+                                                ,somembrs(ii);
+
+                COMMIT;
+
+        END LOOP;
+
       --Above almost always results in overlapping MBRs
-      --Dissolve all that are fully contained or fully containing
-      --columns other than shape are disrespected but at this point are meaningless
-      
+      --Next: dissolve all MBRS that are fully contained or fully containing
+      --      Columns other than shape are disrespected but at this point are meaningless
+      --There will be overlapping MBRS at the conclusion of this call that are
+      --   not dissolved.  This is intentional.  The alternative is to allow MBRs
+      --   to agglomerate until in many cases until 1 MBR covers the full extent
+
       TILEREFRESH.DISSOLVETABLE(p_seedtab,
                                 'a.project_name = ''' || params.project_name || ''' ' ||
-                                'AND a.layer_name = ''' || params.layer_name || '''', 
+                                'AND a.layer_name = ''' || params.layer_name || '''',
                                 'SEEDID', --pkc
                                 p_tolerance,
                                 'INSIDE+COVEREDBY+CONTAINS+COVERS+EQUAL');
 
       --update final call with bounding box mbrs
-      
+
       psql := 'UPDATE ' || p_seedtab || ' t '
            || 'SET '
            || 't.coords = '
@@ -475,7 +510,7 @@ AS
            || 'WHERE '
            || 't.project_name = :p5 AND '
            || 't.layer_name = :p6 ';
-      
+
       EXECUTE IMMEDIATE psql USING 1,
                                    2,
                                    1,
@@ -484,7 +519,7 @@ AS
                                    params.layer_name;
 
       COMMIT;
-      
+
    END DUMPCALLS;
 
    PROCEDURE INSERT_SDOGEOM_METADATA (
@@ -879,15 +914,15 @@ PROCEDURE ADD_SPATIAL_INDEX (
 
       --mschell! 20160624
 
-      --All indicated records that are not spatially disjoint (or specified mask) 
-      --will be combined. 
+      --All indicated records that are not spatially disjoint (or specified mask)
+      --will be combined.
       --Other columns will not be maintained and some records will disappear.
       --For ex
       --If record A dissolves with record B
       --   Record A spatial extent will grow to incorporate B extent
       --   Record A columns other than shape will be untouched
       --   Record B will be deleted.
-      
+
       TYPE numberarray IS TABLE OF NUMBER
       INDEX BY PLS_INTEGER;
       allobjectids         numberarray;
@@ -921,7 +956,7 @@ PROCEDURE ADD_SPATIAL_INDEX (
 
       --dbms_output.put_line(psql);
       --dbms_output.put_line('got ' || allobjectids.COUNT);
-      
+
       FOR i IN 1 .. allobjectids.COUNT
       LOOP
 
