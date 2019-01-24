@@ -1,4 +1,4 @@
---sqlplus basemap/iluvdoitt247@geocdev.doitt.nycnet @NEIGHBORHOOD_PT_SDO_2263_2.sql
+--sqlplus basemap/iluvdoitt247@geocdev.doitt.nycnet @scripts/neighborhood_point_sdo.sql
 DELETE FROM basemap.tilerefresh_params
       WHERE project_name = 'BASEMAP' AND layer_name = 'NEIGHBORHOOD_POINT_SDO';
 INSERT INTO basemap.tilerefresh_params (
@@ -12,13 +12,14 @@ INSERT INTO basemap.tilerefresh_params (
                                 cols)
      VALUES (  'BASEMAP',
                'NEIGHBORHOOD_POINT_SDO',
-               'NEIGHBORHOOD_POINT_SDO_X', --temp view wired to old dataset
+               'NEIGHBORHOOD_POINT_SDO_OLD', --temp view wired to old dataset
                'NEIGHBORHOOD_POINT_SDO',   --current
                'objectid',
-               'pjareaname',
-               3857,
-               'PJAREANAME');  --just name column
-COMMIT;
+               'pjareaname',  --name is the business key. Almost all changed
+               3857, 
+               'PJAREANAME'
+               );  
+               COMMIT;
 --remove previous seeds if run
 DELETE FROM tilerefresh_seeds
       WHERE project_name = 'BASEMAP' AND layer_name = 'NEIGHBORHOOD_POINT_SDO';

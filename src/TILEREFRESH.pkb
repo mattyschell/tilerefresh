@@ -1,528 +1,7 @@
 CREATE OR REPLACE PACKAGE BODY TILEREFRESH
 AS
 
-
-   PROCEDURE CREATE_TRPARAMS (
-      p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_PARAMS',
-      p_replace         IN VARCHAR2 DEFAULT 'N'
-   )
-   AS
-
-      --mschell! 20170609
-      --input parameters for tile refresh
-
-      psql              VARCHAR2(4000);
-
-   BEGIN
-
-      psql := 'CREATE TABLE ' ||  p_tabname || ' ('
-           || 'project_name         VARCHAR2(32), '
-           || 'layer_name           VARCHAR2(32), '
-           || 'table1               VARCHAR2(32), '
-           || 'table2               VARCHAR2(32), '
-           || 'synthkey             VARCHAR2(32), '
-           || 'businesskey          VARCHAR2(32), '
-           || 'srid                 NUMBER, '
-           || 'cols                 VARCHAR2(4000), '
-           || 'PRIMARY KEY (project_name, layer_name)) ';
-
-      BEGIN
-
-         EXECUTE IMMEDIATE psql;
-
-      EXCEPTION
-      WHEN OTHERS
-      THEN
-
-         IF SQLCODE = -955
-         AND p_replace = 'Y'
-         THEN
-
-            EXECUTE IMMEDIATE 'DROP TABLE ' || p_tabname;
-
-            TILEREFRESH.CREATE_TRPARAMS(p_tabname,
-                                        'N');
-
-         ELSE
-
-            RAISE_APPLICATION_ERROR(-20001, SQLERRM || 'on ' || psql);
-
-         END IF;
-
-      END;
-
-   END CREATE_TRPARAMS;
-
-   PROCEDURE CREATE_TRSEEDS (
-      p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDS',
-      p_replace         IN VARCHAR2 DEFAULT 'N',
-      p_srid            IN NUMBER DEFAULT 3857,
-      p_tolerance       IN NUMBER DEFAULT .0001
-   )
-   AS
-
-      --mschell! 20170612
-      --output table to record seed calls
-
-      psql              VARCHAR2(4000);
-
-   BEGIN
-
-      psql := 'CREATE TABLE ' ||  p_tabname || ' ('
-           || 'seedid               INTEGER PRIMARY KEY, '
-           || 'project_name         VARCHAR2(32), '
-           || 'layer_name           VARCHAR2(32), '
-           || 'shape                SDO_GEOMETRY, '
-           || 'coords               VARCHAR2(4000), '
-           || 'date_last_modified   DATE '
-           || ') ';
-
-      BEGIN
-
-         EXECUTE IMMEDIATE psql;
-
-      EXCEPTION
-      WHEN OTHERS
-      THEN
-
-         IF SQLCODE = -955
-         AND p_replace = 'Y'
-         THEN
-
-            TILEREFRESH.DROP_TRSEEDS(p_tabname);
-
-            TILEREFRESH.CREATE_TRSEEDS(p_tabname,
-                                       'N',
-                                       p_srid,
-                                       p_tolerance);
-
-            RETURN;
-
-         ELSE
-
-            RAISE_APPLICATION_ERROR(-20001, SQLERRM || 'on ' || psql);
-
-         END IF;
-
-      END;
-
-      psql := 'CREATE SEQUENCE ' || p_tabname || 'SEQ '
-           || 'START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE';
-
-      EXECUTE IMMEDIATE psql;
-
-      psql := 'CREATE OR REPLACE TRIGGER ' || p_tabname || 'TRG '
-           || 'BEFORE INSERT OR UPDATE ON ' || p_tabname || ' '
-           || 'FOR EACH ROW '
-           || 'BEGIN '
-           || '   :NEW.date_last_modified := CURRENT_DATE; '
-           || 'END; ';
-
-      EXECUTE IMMEDIATE psql;
-
-      TILEREFRESH.add_spatial_index(p_tabname,
-                                    'SHAPE',
-                                    p_srid,
-                                    p_tolerance);
-
-   END CREATE_TRSEEDS;
-
-
-   PROCEDURE DROP_TRSEEDS (
-      p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDS'
-   )
-   AS
-
-      --mschell! 20170620
-      --becuz sequence
-
-   BEGIN
-
-      EXECUTE IMMEDIATE 'DROP TABLE ' || p_tabname;
-
-      EXECUTE IMMEDIATE 'DROP SEQUENCE ' || p_tabname || 'SEQ ';
-
-   END DROP_TRSEEDS;
-
-    PROCEDURE TUNE_TRSEEDS (
-       p_tabname    IN VARCHAR DEFAULT 'TILEREFRESH_SEEDS'
-    )
-    AS
-
-        --tilerefresh_seeds gets fragmented after hundreds of thousands
-        --   of records get dissolved, often several times
-        --intent is to call this from a gradle task 
-
-    BEGIN
-
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' ENABLE ROW MOVEMENT';
-
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' SHRINK SPACE COMPACT';
-
-        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' SHRINK SPACE';
-
-    END TUNE_TRSEEDS;
-
-
-   FUNCTION GET_TRPARAMS (
-      p_project_name     IN VARCHAR2,
-      p_layer_name      IN VARCHAR2,
-      p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_PARAMS'
-   ) RETURN TILEREFRESH.TRPARAMS_REC
-   AS
-
-      --mschell! 20170612
-
-      psql     VARCHAR2(4000);
-      output   TILEREFRESH.TRPARAMS_REC;
-
-   BEGIN
-
-      psql := 'SELECT * FROM ' || p_tabname || ' a '
-           || 'WHERE '
-           || 'UPPER(a.project_name) = :p1 AND '
-           || 'UPPER(a.layer_name) = :p2 ';
-
-      BEGIN
-
-         EXECUTE IMMEDIATE psql INTO output USING UPPER(p_project_name),
-                                                  UPPER(p_layer_name);
-
-      EXCEPTION
-      WHEN OTHERS
-      THEN
-
-          RAISE_APPLICATION_ERROR(-20001, SQLERRM || ' on ' || psql ||
-                                          ' using ' ||  UPPER(p_project_name) ||
-                                          ',' || UPPER(p_layer_name));
-
-      END;
-
-      RETURN output;
-
-   END GET_TRPARAMS;
-
-
-   FUNCTION DUMPDIFFSSDO (
-      p_tab1            IN VARCHAR2,
-      p_tab2            IN VARCHAR2,
-      p_synthkey        IN VARCHAR2,
-      p_businesskey     IN VARCHAR2,
-      p_srid            IN NUMBER DEFAULT 3857,
-      p_tolerance       IN VARCHAR2 DEFAULT .0001,
-      p_cols            IN VARCHAR2 DEFAULT NULL
-   ) RETURN TILEREFRESH.MBRSDOTAB PIPELINED
-   AS
-
-      --mschell! 20170613
-
-      --dump diffs sdo kernel
-      --called by dumpdiffs
-      --can also use this one to populate a table with sdo_geometry
-      --for review in QGIS or Arcmap
-
-      --select * FROM
-      --TABLE(tilerefresh.DUMPDIFFSSDO('BUILDING_SDO_2263_1',
-      --                               'BUILDING_SDO_2263_2',
-      --                               'objectid',
-      --                               'doitt_id',
-      --                               3857)) t
-
-      --sample SQL fully expanded and pulled out as x1,y1,x2,y2 looks something like:
-      --
-      --SELECT sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
-      --         sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),2) || ',' ||
-      --         sdo_geom.sdo_max_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
-      --         sdo_geom.sdo_max_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),2) coords
-      --  FROM BUILDING_SDO_2263_2 a,
-      --  TABLE (
-      --          SELECT GisLayer ('BUILDING_SDO_2263_2', 'objectid', 'doitt_id').Ldiff (
-      --                    GisLayer ('BUILDING_SDO_2263_1', 'objectid', 'doitt_id'))
-      --            FROM DUAL) t
-      -- WHERE t.COLUMN_VALUE = a.doitt_id
-      --UNION ALL -- change to union to remove dupe mbrs
-      --  SELECT sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
-      --         sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),2) || ',' ||
-      --         sdo_geom.sdo_max_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
-      --         sdo_geom.sdo_max_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),2) coords
-      --  FROM BUILDING_SDO_2263_1 a,
-      --  TABLE (
-      --          SELECT GisLayer ('BUILDING_SDO_2263_1', 'objectid', 'doitt_id').Ldiff (
-      --                    GisLayer ('BUILDING_SDO_2263_2', 'objectid', 'doitt_id'))
-      --            FROM DUAL) t
-      -- WHERE t.COLUMN_VALUE = a.doitt_id
-
-      psql1             VARCHAR2(4000);
-      psql2             VARCHAR2(4000);
-      psql3             VARCHAR2(4000);
-      my_cursor         SYS_REFCURSOR;
-      somembrs          TILEREFRESH.MBRSDOTAB;
-      verbose           PLS_INTEGER := 0;
-
-   BEGIN
-
-      -- not like this.  90% sure
-      -- || 'SDO_CS.transform(SDO_GEOM.sdo_mbr(a.shape), :p1) '
-
-      psql1 := 'SELECT '
-            || 'SDO_GEOM.sdo_mbr(SDO_CS.transform(a.shape, :p1)) '
-            || 'FROM '; --tablename a,
-
-      psql2 := ' a, '
-            || 'TABLE( '
-            || '     SELECT GisLayer(:p2, :p3, :p4).Ldiff( '
-            || '            GisLayer(:p5, :p6, :p7)';
-
-      IF p_cols IS NOT NULL
-      THEN
-
-         psql2 := psql2 || ',:p8';
-
-      END IF;
-
-      psql3 := ') '
-            || '     FROM DUAL) t '
-            || 'WHERE '
-            || 't.COLUMN_VALUE = a.' || p_businesskey || ' AND '
-            || 'a.shape IS NOT NULL ';
-
-      IF verbose = 1
-      THEN
-         dbms_output.put_line (psql1 || p_tab2 || psql2 || psql3);
-         dbms_output.put_line('using ' || p_srid || ',' || p_tab2 || ',' ||
-                              p_synthkey || ',' || p_businesskey || ',' ||
-                              p_tab1 || ',' ||  p_synthkey|| ',' ||  p_businesskey || ',' ||
-                              p_cols);
-      END IF;
-
-      IF p_cols IS NULL
-      THEN
-
-         OPEN my_cursor FOR psql1 || p_tab2 || psql2 || psql3
-                        USING p_srid,
-                              p_tab2, p_synthkey, p_businesskey,
-                              p_tab1, p_synthkey, p_businesskey;
-
-      ELSE
-
-         OPEN my_cursor FOR psql1 || p_tab2 || psql2 || psql3
-                        USING p_srid,
-                              p_tab2, p_synthkey, p_businesskey,
-                              p_tab1, p_synthkey, p_businesskey,
-                              p_cols;
-
-      END IF;
-
-      LOOP
-
-         FETCH my_cursor BULK COLLECT INTO somembrs LIMIT 50;
-
-         EXIT WHEN somembrs.COUNT = 0;
-
-         FOR i IN 1 .. somembrs.COUNT
-         LOOP
-
-            IF somembrs(i).mbr.get_gtype() = 1
-            THEN
-
-               -- mbr of a point is a point, does not work for us
-               -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
-               -- we can do this ourselves yes we can
-               somembrs(i).mbr := SDO_GEOMETRY(2003,
-                                               somembrs(i).mbr.sdo_srid,
-                                               NULL,
-                                               SDO_ELEM_INFO_ARRAY(1,1003,3),
-                                               SDO_ORDINATE_ARRAY(somembrs(i).mbr.sdo_ordinates(1) - p_tolerance * 2,
-                                                                  somembrs(i).mbr.sdo_ordinates(2) - p_tolerance * 2,
-                                                                  somembrs(i).mbr.sdo_ordinates(1) + p_tolerance * 2,
-                                                                  somembrs(i).mbr.sdo_ordinates(2) + p_tolerance * 2)
-                                               );
-
-            END IF;
-
-            PIPE ROW(somembrs(i));
-
-         END LOOP;
-
-      END LOOP;
-
-      IF verbose = 1
-      THEN
-         dbms_output.put_line('dumpdiffs sdo part 2');
-         dbms_output.put_line (psql1 || p_tab1 || psql2 || psql3);
-         dbms_output.put_line('using ' || p_srid || ',' || p_tab1 || ',' ||
-                              p_synthkey || ',' || p_businesskey || ',' ||
-                              p_tab2 || ',' ||  p_synthkey|| ',' ||  p_businesskey || ',' ||
-                              p_cols);
-      END IF;
-
-      IF p_cols IS NULL
-      THEN
-
-         --reverse tables. symmetric difference
-         OPEN my_cursor FOR psql1 || p_tab1 || psql2 || psql3
-                        USING p_srid,
-                              p_tab1, p_synthkey, p_businesskey,
-                              p_tab2, p_synthkey, p_businesskey;
-
-      ELSE
-
-         OPEN my_cursor FOR psql1 || p_tab1 || psql2 || psql3
-                        USING p_srid,
-                              p_tab1, p_synthkey, p_businesskey,
-                              p_tab2, p_synthkey, p_businesskey,
-                              p_cols;
-
-      END IF;
-
-      LOOP
-
-         FETCH my_cursor BULK COLLECT INTO somembrs LIMIT 50;
-
-         EXIT WHEN somembrs.COUNT = 0;
-
-         FOR i IN 1 .. somembrs.COUNT
-         LOOP
-
-            IF somembrs(i).mbr.get_gtype() = 1
-            THEN
-
-               -- mbr of a point is a point, does not work for us
-               -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
-               -- we can do this ourselves yes we can
-               somembrs(i).mbr := SDO_GEOMETRY(
-                                    2003,
-                                    somembrs(i).mbr.sdo_srid,
-                                    NULL,
-                                    SDO_ELEM_INFO_ARRAY(1,1003,3),
-                                    SDO_ORDINATE_ARRAY(somembrs(i).mbr.sdo_ordinates(1) - p_tolerance * 2,
-                                                       somembrs(i).mbr.sdo_ordinates(2) - p_tolerance * 2,
-                                                       somembrs(i).mbr.sdo_ordinates(1) + p_tolerance * 2,
-                                                       somembrs(i).mbr.sdo_ordinates(2) + p_tolerance * 2)
-                                               );
-
-            END IF;
-
-            PIPE ROW(somembrs(i));
-
-         END LOOP;
-
-      END LOOP;
-
-      RETURN;
-
-   END DUMPDIFFSSDO;
-
-
-   PROCEDURE DUMPCALLS (
-      p_project_name    IN VARCHAR2,
-      p_layer_name      IN VARCHAR2,
-      p_params          IN VARCHAR2 DEFAULT 'TILEREFRESH_PARAMS',
-      p_sequence        IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDSSEQ',
-      p_tolerance       IN NUMBER DEFAULT .0001,
-      p_seedtab         IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDS'
-   )
-   AS
-
-     --mschell! 20170609
-     --this is a wrapper to push MBRs into a table
-     --it wraps DUMPDIFFSSDO which is the core MBR-producing code
-
-     --CALL tilerefresh.DUMPCALLS('BASEMAP',
-     --                           'centerline');
-
-     params             TRPARAMS_REC;
-     my_cursor          SYS_REFCURSOR;
-     psql               VARCHAR2(4000);
-     isql               VARCHAR2(4000);
-     someids            tilerefresh.stringarray;
-     somembrs           MDSYS.SDO_GEOMETRY_ARRAY := MDSYS.SDO_GEOMETRY_ARRAY();
-
-   BEGIN
-
-        params := TILEREFRESH.GET_TRPARAMS(p_project_name,
-                                           p_layer_name,
-                                           p_params);
-
-        psql := 'SELECT'
-             || ' ' || p_sequence || '.NEXTVAL' 
-             || ', t.mbr'
-             || ' FROM'
-             || ' TABLE(tilerefresh.DUMPDIFFSSDO(:p1,:p2,:p3,:p4,:p5,:p6,:p7)) t';
-
-         OPEN my_cursor FOR psql USING params.table1
-                                      ,params.table2
-                                      ,params.synthkey
-                                      ,params.businesskey
-                                      ,params.srid
-                                      ,p_tolerance
-                                      ,params.cols;
-
-        LOOP
-
-            --rationale for sys_refcursor and commits in chunks of 50:
-            --I was running out of undo on bulk inserts
-            --could be due to other unrelated ETLS running, not sure
-
-            FETCH my_cursor BULK COLLECT INTO someids
-                                             ,somembrs LIMIT 50;
-
-            EXIT WHEN someids.COUNT = 0;
-
-                isql := 'INSERT INTO ' || p_seedtab || ' '
-                     || '(seedid, project_name, layer_name, shape) '
-                     || 'VALUES '
-                     || '(:p1,:p2,:p3,:p4)';
-
-                FORALL ii in 1 .. someids.COUNT
-                    EXECUTE IMMEDIATE isql USING someids(ii)
-                                                ,params.project_name
-                                                ,params.layer_name
-                                                ,somembrs(ii);
-
-                COMMIT;
-
-        END LOOP;
-
-      --Above almost always results in overlapping MBRs
-      --Next: dissolve all MBRS that are fully contained or fully containing
-      --      Columns other than shape are disrespected but at this point are meaningless
-      --There will be overlapping MBRS at the conclusion of this call that are
-      --   not dissolved.  This is intentional.  The alternative is to allow MBRs
-      --   to agglomerate until in many cases until 1 MBR covers the full extent
-
-      TILEREFRESH.DISSOLVETABLE(p_seedtab,
-                                'a.project_name = ''' || params.project_name || ''' ' ||
-                                'AND a.layer_name = ''' || params.layer_name || '''',
-                                'SEEDID', --pkc
-                                p_tolerance,
-                                'INSIDE+COVEREDBY+CONTAINS+COVERS+EQUAL');
-
-      --update final call with bounding box mbrs
-
-      psql := 'UPDATE ' || p_seedtab || ' t '
-           || 'SET '
-           || 't.coords = '
-           || 'TO_CHAR(sdo_geom.sdo_min_mbr_ordinate(t.shape, :p1)) || '','' || '
-           || 'TO_CHAR(sdo_geom.sdo_min_mbr_ordinate(t.shape, :p2)) || '','' || '
-           || 'TO_CHAR(sdo_geom.sdo_max_mbr_ordinate(t.shape, :p3)) || '','' || '
-           || 'TO_CHAR(sdo_geom.sdo_max_mbr_ordinate(t.shape, :p4)) '
-           || 'WHERE '
-           || 't.project_name = :p5 AND '
-           || 't.layer_name = :p6 ';
-
-      EXECUTE IMMEDIATE psql USING 1,
-                                   2,
-                                   1,
-                                   2,
-                                   params.project_name,
-                                   params.layer_name;
-
-      COMMIT;
-
-   END DUMPCALLS;
-
-   PROCEDURE INSERT_SDOGEOM_METADATA (
+    PROCEDURE INSERT_SDOGEOM_METADATA (
       p_table_name      IN VARCHAR2,
       p_column_name     IN VARCHAR2,
       p_srid            IN NUMBER,
@@ -902,6 +381,548 @@ PROCEDURE ADD_SPATIAL_INDEX (
       END;
 
    END ADD_SPATIAL_INDEX;
+
+
+   PROCEDURE CREATE_TRPARAMS (
+      p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_PARAMS',
+      p_replace         IN VARCHAR2 DEFAULT 'N'
+   )
+   AS
+
+      --mschell! 20170609
+      --input parameters for tile refresh
+
+      psql              VARCHAR2(4000);
+
+   BEGIN
+
+      psql := 'CREATE TABLE ' ||  p_tabname || ' ('
+           || 'project_name         VARCHAR2(32), '
+           || 'layer_name           VARCHAR2(32), '
+           || 'table1               VARCHAR2(32), '
+           || 'table2               VARCHAR2(32), '
+           || 'synthkey             VARCHAR2(32), '
+           || 'businesskey          VARCHAR2(32), '
+           || 'srid                 NUMBER, '
+           || 'cols                 VARCHAR2(4000), '
+           || 'PRIMARY KEY (project_name, layer_name)) ';
+
+      BEGIN
+
+         EXECUTE IMMEDIATE psql;
+
+      EXCEPTION
+      WHEN OTHERS
+      THEN
+
+         IF SQLCODE = -955
+         AND p_replace = 'Y'
+         THEN
+
+            EXECUTE IMMEDIATE 'DROP TABLE ' || p_tabname;
+
+            TILEREFRESH.CREATE_TRPARAMS(p_tabname,
+                                        'N');
+
+         ELSE
+
+            RAISE_APPLICATION_ERROR(-20001, SQLERRM || 'on ' || psql);
+
+         END IF;
+
+      END;
+
+   END CREATE_TRPARAMS;
+
+   PROCEDURE CREATE_TRSEEDS (
+      p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDS',
+      p_replace         IN VARCHAR2 DEFAULT 'N',
+      p_srid            IN NUMBER DEFAULT 3857,
+      p_tolerance       IN NUMBER DEFAULT .0001
+   )
+   AS
+
+      --mschell! 20170612
+      --output table to record seed calls
+
+      psql              VARCHAR2(4000);
+
+   BEGIN
+
+      psql := 'CREATE TABLE ' ||  p_tabname || ' ('
+           || 'seedid               INTEGER PRIMARY KEY, '
+           || 'project_name         VARCHAR2(32), '
+           || 'layer_name           VARCHAR2(32), '
+           || 'shape                SDO_GEOMETRY, '
+           || 'coords               VARCHAR2(4000), '
+           || 'date_last_modified   DATE '
+           || ') ';
+
+      BEGIN
+
+         EXECUTE IMMEDIATE psql;
+
+      EXCEPTION
+      WHEN OTHERS
+      THEN
+
+         IF SQLCODE = -955
+         AND p_replace = 'Y'
+         THEN
+
+            TILEREFRESH.DROP_TRSEEDS(p_tabname);
+
+            TILEREFRESH.CREATE_TRSEEDS(p_tabname,
+                                       'N',
+                                       p_srid,
+                                       p_tolerance);
+
+            RETURN;
+
+         ELSE
+
+            RAISE_APPLICATION_ERROR(-20001, SQLERRM || 'on ' || psql);
+
+         END IF;
+
+      END;
+
+      psql := 'CREATE SEQUENCE ' || p_tabname || 'SEQ '
+           || 'START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE';
+
+      EXECUTE IMMEDIATE psql;
+
+      psql := 'CREATE OR REPLACE TRIGGER ' || p_tabname || 'TRG '
+           || 'BEFORE INSERT OR UPDATE ON ' || p_tabname || ' '
+           || 'FOR EACH ROW '
+           || 'BEGIN '
+           || '   :NEW.date_last_modified := CURRENT_DATE; '
+           || 'END; ';
+
+      EXECUTE IMMEDIATE psql;
+
+      TILEREFRESH.add_spatial_index(p_tabname,
+                                    'SHAPE',
+                                    p_srid,
+                                    p_tolerance);
+
+   END CREATE_TRSEEDS;
+
+
+   PROCEDURE DROP_TRSEEDS (
+      p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDS'
+   )
+   AS
+
+      --mschell! 20170620
+      --becuz sequence
+
+   BEGIN
+
+      EXECUTE IMMEDIATE 'DROP TABLE ' || p_tabname;
+
+      EXECUTE IMMEDIATE 'DROP SEQUENCE ' || p_tabname || 'SEQ ';
+
+   END DROP_TRSEEDS;
+
+--    PROCEDURE TUNE_TRSEEDS (
+--        p_tabname        IN VARCHAR DEFAULT 'TILEREFRESH_SEEDS'
+--       ,p_srid           IN NUMBER DEFAULT 3857
+--       ,p_tolerance      IN NUMBER DEFAULT .0001
+--    )
+--    AS
+--
+--        --tilerefresh_seeds becomes fragmented after
+--        --   records get dissolved, often several times
+--        --intent is to call this from a gradle task
+--        --I think this only happens for reals when I blow up something and 
+--        -- insert too many rows... revisit if necessary, need to deal with TRG
+--        -- 
+--
+--    BEGIN
+--
+--        DROP_SPATIAL_INDEX( p_tabname
+--                           ,'SHAPE')
+--
+--        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' ENABLE ROW MOVEMENT';
+--
+--        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' SHRINK SPACE COMPACT';
+--
+--        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_tabname || ' SHRINK SPACE';
+--
+--        TILEREFRESH.add_spatial_index( p_tabname
+--                                      ,'SHAPE',
+--                                      ,p_srid,
+--                                      ,p_tolerance);
+--
+--        DBMS_STATS.GATHER_TABLE_STATS( ownname => USER
+--                                      ,tabname => p_tabname
+--                                      ,granularity => 'AUTO'               
+--                                      ,degree => 1                         
+--                                      ,cascade => DBMS_STATS.AUTO_CASCADE);
+--
+--    END TUNE_TRSEEDS;
+
+
+   FUNCTION GET_TRPARAMS (
+      p_project_name     IN VARCHAR2,
+      p_layer_name      IN VARCHAR2,
+      p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_PARAMS'
+   ) RETURN TILEREFRESH.TRPARAMS_REC
+   AS
+
+      --mschell! 20170612
+
+      psql     VARCHAR2(4000);
+      output   TILEREFRESH.TRPARAMS_REC;
+
+   BEGIN
+
+      psql := 'SELECT * FROM ' || p_tabname || ' a '
+           || 'WHERE '
+           || 'UPPER(a.project_name) = :p1 AND '
+           || 'UPPER(a.layer_name) = :p2 ';
+
+      BEGIN
+
+         EXECUTE IMMEDIATE psql INTO output USING UPPER(p_project_name),
+                                                  UPPER(p_layer_name);
+
+      EXCEPTION
+      WHEN OTHERS
+      THEN
+
+          RAISE_APPLICATION_ERROR(-20001, SQLERRM || ' on ' || psql ||
+                                          ' using ' ||  UPPER(p_project_name) ||
+                                          ',' || UPPER(p_layer_name));
+
+      END;
+
+      RETURN output;
+
+   END GET_TRPARAMS;
+
+
+   FUNCTION DUMPDIFFSSDO (
+      p_tab1            IN VARCHAR2,
+      p_tab2            IN VARCHAR2,
+      p_synthkey        IN VARCHAR2,
+      p_businesskey     IN VARCHAR2,
+      p_srid            IN NUMBER DEFAULT 3857,
+      p_tolerance       IN VARCHAR2 DEFAULT .0001,
+      p_cols            IN VARCHAR2 DEFAULT NULL
+   ) RETURN TILEREFRESH.MBRSDOTAB PIPELINED
+   AS
+
+      --mschell! 20170613
+
+      --dump diffs sdo kernel
+      --called by dumpdiffs
+      --can also use this one to populate a table with sdo_geometry
+      --for review in QGIS or Arcmap
+
+      --select * FROM
+      --TABLE(tilerefresh.DUMPDIFFSSDO('BUILDING_SDO_2263_1',
+      --                               'BUILDING_SDO_2263_2',
+      --                               'objectid',
+      --                               'doitt_id',
+      --                               3857)) t
+
+      --sample SQL fully expanded and pulled out as x1,y1,x2,y2 looks something like:
+      --
+      --SELECT sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
+      --         sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),2) || ',' ||
+      --         sdo_geom.sdo_max_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
+      --         sdo_geom.sdo_max_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),2) coords
+      --  FROM BUILDING_SDO_2263_2 a,
+      --  TABLE (
+      --          SELECT GisLayer ('BUILDING_SDO_2263_2', 'objectid', 'doitt_id').Ldiff (
+      --                    GisLayer ('BUILDING_SDO_2263_1', 'objectid', 'doitt_id'))
+      --            FROM DUAL) t
+      -- WHERE t.COLUMN_VALUE = a.doitt_id
+      --UNION ALL -- change to union to remove dupe mbrs
+      --  SELECT sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
+      --         sdo_geom.sdo_min_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),2) || ',' ||
+      --         sdo_geom.sdo_max_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),1) || ',' ||
+      --         sdo_geom.sdo_max_mbr_ordinate(SDO_CS.transform (SDO_GEOM.sdo_mbr (a.shape), 3857),2) coords
+      --  FROM BUILDING_SDO_2263_1 a,
+      --  TABLE (
+      --          SELECT GisLayer ('BUILDING_SDO_2263_1', 'objectid', 'doitt_id').Ldiff (
+      --                    GisLayer ('BUILDING_SDO_2263_2', 'objectid', 'doitt_id'))
+      --            FROM DUAL) t
+      -- WHERE t.COLUMN_VALUE = a.doitt_id
+
+      psql1             VARCHAR2(4000);
+      psql2             VARCHAR2(4000);
+      psql3             VARCHAR2(4000);
+      my_cursor         SYS_REFCURSOR;
+      somembrs          TILEREFRESH.MBRSDOTAB;
+      verbose           PLS_INTEGER := 0;
+
+   BEGIN
+
+      -- not like this.  90% sure
+      -- || 'SDO_CS.transform(SDO_GEOM.sdo_mbr(a.shape), :p1) '
+
+      psql1 := 'SELECT '
+            || 'SDO_GEOM.sdo_mbr(SDO_CS.transform(a.shape, :p1)) '
+            || 'FROM '; --tablename a,
+
+      psql2 := ' a, '
+            || 'TABLE( '
+            || '     SELECT GisLayer(:p2, :p3, :p4).Ldiff( '
+            || '            GisLayer(:p5, :p6, :p7)';
+
+      IF p_cols IS NOT NULL
+      THEN
+
+         psql2 := psql2 || ',:p8';
+
+      END IF;
+
+      psql3 := ') '
+            || '     FROM DUAL) t '
+            || 'WHERE '
+            || 't.COLUMN_VALUE = a.' || p_businesskey || ' AND '
+            || 'a.shape IS NOT NULL ';
+
+      IF verbose = 1
+      THEN
+         dbms_output.put_line (psql1 || p_tab2 || psql2 || psql3);
+         dbms_output.put_line('using ' || p_srid || ',' || p_tab2 || ',' ||
+                              p_synthkey || ',' || p_businesskey || ',' ||
+                              p_tab1 || ',' ||  p_synthkey|| ',' ||  p_businesskey || ',' ||
+                              p_cols);
+      END IF;
+
+      IF p_cols IS NULL
+      THEN
+
+         OPEN my_cursor FOR psql1 || p_tab2 || psql2 || psql3
+                        USING p_srid,
+                              p_tab2, p_synthkey, p_businesskey,
+                              p_tab1, p_synthkey, p_businesskey;
+
+      ELSE
+
+         OPEN my_cursor FOR psql1 || p_tab2 || psql2 || psql3
+                        USING p_srid,
+                              p_tab2, p_synthkey, p_businesskey,
+                              p_tab1, p_synthkey, p_businesskey,
+                              p_cols;
+
+      END IF;
+
+      LOOP
+
+         FETCH my_cursor BULK COLLECT INTO somembrs LIMIT 50;
+
+         EXIT WHEN somembrs.COUNT = 0;
+
+         FOR i IN 1 .. somembrs.COUNT
+         LOOP
+
+            IF somembrs(i).mbr.get_gtype() = 1
+            THEN
+
+               -- mbr of a point is a point, does not work for us
+               -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
+               -- we can do this ourselves yes we can
+               somembrs(i).mbr := SDO_GEOMETRY(2003,
+                                               somembrs(i).mbr.sdo_srid,
+                                               NULL,
+                                               SDO_ELEM_INFO_ARRAY(1,1003,3),
+                                               SDO_ORDINATE_ARRAY(somembrs(i).mbr.sdo_ordinates(1) - p_tolerance * 2,
+                                                                  somembrs(i).mbr.sdo_ordinates(2) - p_tolerance * 2,
+                                                                  somembrs(i).mbr.sdo_ordinates(1) + p_tolerance * 2,
+                                                                  somembrs(i).mbr.sdo_ordinates(2) + p_tolerance * 2)
+                                               );
+
+            END IF;
+
+            PIPE ROW(somembrs(i));
+
+         END LOOP;
+
+      END LOOP;
+
+      IF verbose = 1
+      THEN
+         dbms_output.put_line('dumpdiffs sdo part 2');
+         dbms_output.put_line (psql1 || p_tab1 || psql2 || psql3);
+         dbms_output.put_line('using ' || p_srid || ',' || p_tab1 || ',' ||
+                              p_synthkey || ',' || p_businesskey || ',' ||
+                              p_tab2 || ',' ||  p_synthkey|| ',' ||  p_businesskey || ',' ||
+                              p_cols);
+      END IF;
+
+      IF p_cols IS NULL
+      THEN
+
+         --reverse tables. symmetric difference
+         OPEN my_cursor FOR psql1 || p_tab1 || psql2 || psql3
+                        USING p_srid,
+                              p_tab1, p_synthkey, p_businesskey,
+                              p_tab2, p_synthkey, p_businesskey;
+
+      ELSE
+
+         OPEN my_cursor FOR psql1 || p_tab1 || psql2 || psql3
+                        USING p_srid,
+                              p_tab1, p_synthkey, p_businesskey,
+                              p_tab2, p_synthkey, p_businesskey,
+                              p_cols;
+
+      END IF;
+
+      LOOP
+
+         FETCH my_cursor BULK COLLECT INTO somembrs LIMIT 50;
+
+         EXIT WHEN somembrs.COUNT = 0;
+
+         FOR i IN 1 .. somembrs.COUNT
+         LOOP
+
+            IF somembrs(i).mbr.get_gtype() = 1
+            THEN
+
+               -- mbr of a point is a point, does not work for us
+               -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
+               -- we can do this ourselves yes we can
+               somembrs(i).mbr := SDO_GEOMETRY(
+                                    2003,
+                                    somembrs(i).mbr.sdo_srid,
+                                    NULL,
+                                    SDO_ELEM_INFO_ARRAY(1,1003,3),
+                                    SDO_ORDINATE_ARRAY(somembrs(i).mbr.sdo_ordinates(1) - p_tolerance * 2,
+                                                       somembrs(i).mbr.sdo_ordinates(2) - p_tolerance * 2,
+                                                       somembrs(i).mbr.sdo_ordinates(1) + p_tolerance * 2,
+                                                       somembrs(i).mbr.sdo_ordinates(2) + p_tolerance * 2)
+                                               );
+
+            END IF;
+
+            PIPE ROW(somembrs(i));
+
+         END LOOP;
+
+      END LOOP;
+
+      RETURN;
+
+   END DUMPDIFFSSDO;
+
+
+   PROCEDURE DUMPCALLS (
+      p_project_name    IN VARCHAR2,
+      p_layer_name      IN VARCHAR2,
+      p_params          IN VARCHAR2 DEFAULT 'TILEREFRESH_PARAMS',
+      p_sequence        IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDSSEQ',
+      p_tolerance       IN NUMBER DEFAULT .0001,
+      p_seedtab         IN VARCHAR2 DEFAULT 'TILEREFRESH_SEEDS'
+   )
+   AS
+
+     --mschell! 20170609
+     --this is a wrapper to push MBRs into a table
+     --it wraps DUMPDIFFSSDO which is the core MBR-producing code
+
+     --CALL tilerefresh.DUMPCALLS('BASEMAP',
+     --                           'centerline');
+
+     params             TRPARAMS_REC;
+     my_cursor          SYS_REFCURSOR;
+     psql               VARCHAR2(4000);
+     isql               VARCHAR2(4000);
+     someids            tilerefresh.stringarray;
+     somembrs           MDSYS.SDO_GEOMETRY_ARRAY := MDSYS.SDO_GEOMETRY_ARRAY();
+
+   BEGIN
+
+        params := TILEREFRESH.GET_TRPARAMS(p_project_name,
+                                           p_layer_name,
+                                           p_params);
+
+        psql := 'SELECT'
+             || ' ' || p_sequence || '.NEXTVAL' 
+             || ', t.mbr'
+             || ' FROM'
+             || ' TABLE(tilerefresh.DUMPDIFFSSDO(:p1,:p2,:p3,:p4,:p5,:p6,:p7)) t';
+
+         OPEN my_cursor FOR psql USING params.table1
+                                      ,params.table2
+                                      ,params.synthkey
+                                      ,params.businesskey
+                                      ,params.srid
+                                      ,p_tolerance
+                                      ,params.cols;
+
+        LOOP
+
+            -- rationale for sys_refcursor and commits in chunks of 50:
+            -- I was running out of undo on bulk inserts
+            -- appears to have been due to flubbed setup inserting hundreds of
+            -- thousands of diffs, but Im gonna allow chunked this approach 
+            -- to remain
+
+            FETCH my_cursor BULK COLLECT INTO someids
+                                             ,somembrs LIMIT 50;
+
+            EXIT WHEN someids.COUNT = 0;
+
+                isql := 'INSERT INTO ' || p_seedtab || ' '
+                     || '(seedid, project_name, layer_name, shape) '
+                     || 'VALUES '
+                     || '(:p1,:p2,:p3,:p4)';
+
+                FORALL ii in 1 .. someids.COUNT
+                    EXECUTE IMMEDIATE isql USING someids(ii)
+                                                ,params.project_name
+                                                ,params.layer_name
+                                                ,somembrs(ii);
+
+                COMMIT;
+
+        END LOOP;
+
+      --Above almost always results in overlapping MBRs
+      --Next: dissolve all MBRS that are fully contained or fully containing
+      --      Columns other than shape are disrespected but at this point are meaningless
+      --There will be overlapping MBRS at the conclusion of this call that are
+      --   not dissolved.  This is intentional.  The alternative is to allow MBRs
+      --   to agglomerate until in many cases until 1 MBR covers the full extent
+
+      TILEREFRESH.DISSOLVETABLE(p_seedtab,
+                                'a.project_name = ''' || params.project_name || ''' ' ||
+                                'AND a.layer_name = ''' || params.layer_name || '''',
+                                'SEEDID', --pkc
+                                p_tolerance,
+                                'INSIDE+COVEREDBY+CONTAINS+COVERS+EQUAL');
+
+      --update final call with bounding box mbrs
+
+      psql := 'UPDATE ' || p_seedtab || ' t '
+           || 'SET '
+           || 't.coords = '
+           || 'TO_CHAR(sdo_geom.sdo_min_mbr_ordinate(t.shape, :p1)) || '','' || '
+           || 'TO_CHAR(sdo_geom.sdo_min_mbr_ordinate(t.shape, :p2)) || '','' || '
+           || 'TO_CHAR(sdo_geom.sdo_max_mbr_ordinate(t.shape, :p3)) || '','' || '
+           || 'TO_CHAR(sdo_geom.sdo_max_mbr_ordinate(t.shape, :p4)) '
+           || 'WHERE '
+           || 't.project_name = :p5 AND '
+           || 't.layer_name = :p6 ';
+
+      EXECUTE IMMEDIATE psql USING 1,
+                                   2,
+                                   1,
+                                   2,
+                                   params.project_name,
+                                   params.layer_name;
+
+      COMMIT;
+
+   END DUMPCALLS;
 
    PROCEDURE DISSOLVETABLE (
       p_target_table    IN VARCHAR2,
