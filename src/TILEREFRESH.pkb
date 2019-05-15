@@ -603,6 +603,30 @@ PROCEDURE ADD_SPATIAL_INDEX (
    END GET_TRPARAMS;
 
 
+    FUNCTION MBRPOINT (
+         p_sdo           IN MDSYS.SDO_GEOMETRY
+        ,p_bloat         IN NUMBER
+    ) RETURN MDSYS.SDO_GEOMETRY
+    AS
+
+        -- private
+        -- mschell! 201905015 refactoring
+    
+    BEGIN
+
+        RETURN SDO_GEOMETRY(2003
+                           ,p_sdo.sdo_srid
+                           ,NULL
+                           ,SDO_ELEM_INFO_ARRAY(1,1003,3)
+                           ,SDO_ORDINATE_ARRAY(p_sdo.sdo_ordinates(1) - p_bloat
+                                              ,p_sdo.sdo_ordinates(2) - p_bloat
+                                              ,p_sdo.sdo_ordinates(1) + p_bloat
+                                              ,p_sdo.sdo_ordinates(2) + p_bloat)
+                            );
+
+    END MBRPOINT;
+
+
    FUNCTION DUMPDIFFSSDO (
       p_tab1            IN VARCHAR2
      ,p_tab2            IN VARCHAR2
@@ -616,10 +640,13 @@ PROCEDURE ADD_SPATIAL_INDEX (
 
         --mschell! 20170613
 
-        --dump diffs sdo kernel
-        --called by dumpdiffs
-        --can also use this one to populate a table with sdo_geometry
-        --for review in QGIS or Arcmap
+        -- dump diffs sdo kernel
+        -- called by dumpdiffs
+        -- can also use this one to populate a table with sdo_geometry
+        -- for review in QGIS or Arcmap
+        -- Executive Summary: Given two spatial tables and some columns that we 
+        --                    care about, return MBRs of every location where
+        --                    the tables differ
 
         --select * FROM
         --TABLE(tilerefresh.DUMPDIFFSSDO('BUILDING_SDO_2263_1',
@@ -655,12 +682,16 @@ PROCEDURE ADD_SPATIAL_INDEX (
         psql1                   VARCHAR2(4000);
         psql2                   VARCHAR2(4000);
         psql3                   VARCHAR2(4000);
+        psql1a                  VARCHAR2(4000);
+        psql2a                  VARCHAR2(4000);
+        fullsql                 VARCHAR2(8000);
         my_cursor               SYS_REFCURSOR;
-        TYPE                    SDO_ARRAY_ARRAY IS TABLE OF MDSYS.SDO_GEOMETRY_ARRAY 
-                                INDEX BY PLS_INTEGER;
-        array_of_ringarrays     SDO_ARRAY_ARRAY;
-        somembrs                TILEREFRESH.MBRSDOTAB;
-        verbose                 PLS_INTEGER := 0;
+        array_of_ringarrays     SDO_ARRAY_ARRAY := SDO_ARRAY_ARRAY();
+        --TYPE                    SDO_ARRAY_ARRAY IS TABLE OF MDSYS.SDO_GEOMETRY_ARRAY 
+        --                        INDEX BY PLS_INTEGER;
+        --array_of_ringarrays     SDO_ARRAY_ARRAY;
+        somembrs                TILEREFRESH.MBRSDOTAB := TILEREFRESH.MBRSDOTAB();
+        verbose                 PLS_INTEGER := 1;
         kount                   PLS_INTEGER := 0;
 
     BEGIN
@@ -677,7 +708,7 @@ PROCEDURE ADD_SPATIAL_INDEX (
         -- But its more important to bust up multipolygons and save cycles on
         -- the tile re-generation calls
         -- I dont think I can work with mdsys.sdo_geometry_array from extract_all
-        -- in SQL, gotta pass the geoms back to the cursor and then transform, mbr
+        -- in SQL, gotta pass the geoms back to the cursor then transform and mbr
 
         psql1 := 'SELECT '
               || 'SDO_UTIL.extract_all(a.shape, :p1) '
@@ -701,30 +732,68 @@ PROCEDURE ADD_SPATIAL_INDEX (
                 || 't.COLUMN_VALUE = a.' || p_businesskey || ' AND '
                 || 'a.shape IS NOT NULL ';
 
+        psql1a := 'SELECT '
+              || 'SDO_UTIL.extract_all(a.shape, :p1a) '
+              || 'FROM '; --tablename a,
+
+        psql2a := ' a, '
+                || 'TABLE( '
+                || '     SELECT GisLayer(:p2a, :p3a, :p4a).Ldiff( '
+                || '            GisLayer(:p5a, :p6a, :p7a)';
+
+        IF p_cols IS NOT NULL
+        THEN
+
+            psql2a := psql2a || ',:p8a';
+
+        END IF;
+
+        fullsql := psql1 || p_tab2 || psql2 || psql3 || 
+                   'UNION ALL ' ||
+                   psql1a || p_tab1 || psql2a || psql3;
+
         IF verbose = 1
         THEN
-            dbms_output.put_line (psql1 || p_tab2 || psql2 || psql3);
-            dbms_output.put_line('using ' || p_srid || ',' || p_tab2 || ',' ||
-                                p_synthkey || ',' || p_businesskey || ',' ||
-                                p_tab1 || ',' ||  p_synthkey|| ',' ||  p_businesskey || ',' ||
-                                p_cols);
+            dbms_output.put_line (fullsql);
+            dbms_output.put_line('using');
+            dbms_output.put_line(0 || ',' || 
+                                 p_tab2 || ',' ||
+                                 p_synthkey || ',' || 
+                                 p_businesskey || ',' ||
+                                 p_tab1 || ',' || 
+                                 p_synthkey || ',' || 
+                                 p_businesskey || ',' ||
+                                 0 || ',' ||
+                                 p_tab1 || ',' || 
+                                 p_synthkey || ',' || 
+                                 p_businesskey || ',' ||
+                                 p_tab2 || ',' ||
+                                 p_synthkey || ',' ||
+                                 p_businesskey);        
         END IF;
 
         IF p_cols IS NULL
         THEN
 
-            OPEN my_cursor FOR psql1 || p_tab2 || psql2 || psql3
-                            USING 0,
-                                  p_tab2, p_synthkey, p_businesskey,
-                                  p_tab1, p_synthkey, p_businesskey;
+            OPEN my_cursor FOR fullsql
+                         USING 0,
+                               p_tab2, p_synthkey, p_businesskey,
+                               p_tab1, p_synthkey, p_businesskey,
+                               0,
+                               p_tab1, p_synthkey, p_businesskey,
+                               p_tab2, p_synthkey, p_businesskey;
 
         ELSE
 
-            OPEN my_cursor FOR psql1 || p_tab2 || psql2 || psql3
-                            USING 0,
-                                  p_tab2, p_synthkey, p_businesskey,
-                                  p_tab1, p_synthkey, p_businesskey,
-                                  p_cols;
+            OPEN my_cursor FOR fullsql
+                               USING 0,
+                               p_tab2, p_synthkey, p_businesskey,
+                               p_tab1, p_synthkey, p_businesskey,
+                               p_cols,
+                               0,
+                               p_tab1, p_synthkey, p_businesskey,
+                               p_tab2, p_synthkey, p_businesskey,
+                               p_cols;
 
         END IF;
 
@@ -741,25 +810,37 @@ PROCEDURE ADD_SPATIAL_INDEX (
                 LOOP
 
                     kount := kount + 1;
+                    somembrs.EXTEND(1);
 
-                    somembrs(kount).mbr := SDO_GEOM.sdo_mbr(SDO_CS.transform(array_of_ringarrays(i)(jj)
-                                                                            ,p_srid));
+                    IF array_of_ringarrays(i)(jj).sdo_gtype <> 2001
+                    THEN
 
+                        somembrs(kount).mbr := SDO_GEOM.sdo_mbr(
+                                                    SDO_CS.transform(array_of_ringarrays(i)(jj)
+                                                                    ,p_srid)
+                                               );
+
+                    ELSE
+
+                        -- mbr of a point is a point, does not work for us
+                        -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
+                        -- make sure to bloat using input tolerance units
+                        somembrs(kount).mbr := SDO_GEOM.sdo_mbr(
+                                                    SDO_CS.transform(
+                                                        MBRPOINT(array_of_ringarrays(i)(jj)
+                                                                ,p_tolerance * 2)
+                                                   ,p_srid)
+                                               );
+
+                    END IF;
+                
                     IF somembrs(kount).mbr.get_gtype() = 1
                     THEN
 
                         -- mbr of a point is a point, does not work for us
                         -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
-                        -- we can do this yes we can
-                        somembrs(kount).mbr := SDO_GEOMETRY(2003,
-                                                            somembrs(kount).mbr.sdo_srid,
-                                                            NULL,
-                                                            SDO_ELEM_INFO_ARRAY(1,1003,3),
-                                                            SDO_ORDINATE_ARRAY(somembrs(kount).mbr.sdo_ordinates(1) - p_tolerance * 2,
-                                                                               somembrs(kount).mbr.sdo_ordinates(2) - p_tolerance * 2,
-                                                                               somembrs(kount).mbr.sdo_ordinates(1) + p_tolerance * 2,
-                                                                               somembrs(kount).mbr.sdo_ordinates(2) + p_tolerance * 2)
-                                                            );
+                        somembrs(kount).mbr := MBRPOINT(somembrs(kount).mbr
+                                                       ,p_tolerance * 2);
 
                     END IF;
 
@@ -777,92 +858,10 @@ PROCEDURE ADD_SPATIAL_INDEX (
 
             END LOOP;
 
-        END LOOP;
-
-        IF verbose = 1
-        THEN
-            dbms_output.put_line('dumpdiffs sdo part 2');
-            dbms_output.put_line (psql1 || p_tab1 || psql2 || psql3);
-            dbms_output.put_line('using ' || p_srid || ',' || p_tab1 || ',' ||
-                                 p_synthkey || ',' || p_businesskey || ',' ||
-                                 p_tab2 || ',' ||  p_synthkey|| ',' ||  p_businesskey || ',' ||
-                                 p_cols);
-        END IF;
-
-        IF p_cols IS NULL
-        THEN
-
-            --reverse tables. symmetric difference
-            OPEN my_cursor FOR psql1 || p_tab1 || psql2 || psql3
-                            USING 0,
-                                  p_tab1, p_synthkey, p_businesskey,
-                                  p_tab2, p_synthkey, p_businesskey;
-
-        ELSE
-
-            OPEN my_cursor FOR psql1 || p_tab1 || psql2 || psql3
-                            USING 0,
-                                  p_tab1, p_synthkey, p_businesskey,
-                                  p_tab2, p_synthkey, p_businesskey,
-                                  p_cols;
-
-        END IF;
-
-        --------------------
-        --TODO: Refactor this is ridiculous
-        kount := 0;
-
-        LOOP
-
-            FETCH my_cursor BULK COLLECT INTO array_of_ringarrays LIMIT 25;
-
-            EXIT WHEN array_of_ringarrays.COUNT = 0;
-
-            FOR i IN 1 .. array_of_ringarrays.COUNT
-            LOOP
-
-                FOR jj IN 1 .. array_of_ringarrays(i).COUNT 
-                LOOP
-
-                    kount := kount + 1;
-
-                    somembrs(kount).mbr := SDO_GEOM.sdo_mbr(SDO_CS.transform(array_of_ringarrays(i)(jj)
-                                                                            ,p_srid));
-
-                    IF somembrs(kount).mbr.get_gtype() = 1
-                    THEN
-
-                        -- mbr of a point is a point, does not work for us
-                        -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
-                        -- we can do this yes we can
-                        somembrs(kount).mbr := SDO_GEOMETRY(2003,
-                                                            somembrs(kount).mbr.sdo_srid,
-                                                            NULL,
-                                                            SDO_ELEM_INFO_ARRAY(1,1003,3),
-                                                            SDO_ORDINATE_ARRAY(somembrs(kount).mbr.sdo_ordinates(1) - p_tolerance * 2,
-                                                                               somembrs(kount).mbr.sdo_ordinates(2) - p_tolerance * 2,
-                                                                               somembrs(kount).mbr.sdo_ordinates(1) + p_tolerance * 2,
-                                                                               somembrs(kount).mbr.sdo_ordinates(2) + p_tolerance * 2)
-                                                            );
-
-                    END IF;
-
-                END LOOP;
-
-            END LOOP;
-
-            array_of_ringarrays.DELETE;
-
-            FOR i IN 1 .. somembrs.COUNT
-            LOOP
-
-                -- pop off son, pop off
-                PIPE ROW(somembrs(i));
-
-            END LOOP;
+            somembrs.DELETE;
 
         END LOOP;
-        
+
       RETURN;
 
    END DUMPDIFFSSDO;
