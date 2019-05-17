@@ -609,7 +609,6 @@ PROCEDURE ADD_SPATIAL_INDEX (
     ) RETURN MDSYS.SDO_GEOMETRY
     AS
 
-        -- private
         -- mschell! 201905015 refactoring
     
     BEGIN
@@ -626,6 +625,96 @@ PROCEDURE ADD_SPATIAL_INDEX (
 
     END MBRPOINT;
 
+
+    FUNCTION DUMPDIFFSCUR (
+        p_sql           IN VARCHAR2
+       ,p_tab1          IN VARCHAR2
+       ,p_tab2          IN VARCHAR2
+       ,p_synthkey      IN VARCHAR2
+       ,p_businesskey   IN VARCHAR2
+       ,p_cols          IN VARCHAR2 DEFAULT NULL
+    ) RETURN SYS_REFCURSOR
+    AS
+
+        -- private shame
+        -- mschell! 20190517
+
+        output      SYS_REFCURSOR;        
+
+    BEGIN
+
+        IF p_cols IS NOT NULL
+        THEN
+        
+            OPEN output FOR p_sql
+                        USING p_tab1, p_synthkey, p_businesskey,
+                              p_tab2, p_synthkey, p_businesskey;
+
+        ELSE
+
+            OPEN output FOR p_sql
+                        USING p_tab1, p_synthkey, p_businesskey,
+                              p_tab2, p_synthkey, p_businesskey;
+
+        END IF;
+
+        RETURN output;
+
+    END DUMPDIFFSCUR;
+
+
+    FUNCTION DUMPDIFFADROP (
+        p_geombucketdrop        IN MDSYS.SDO_GEOMETRY
+       ,p_srid                  IN NUMBER
+       ,p_tolerance             IN NUMBER
+    ) RETURN TILEREFRESH.MBRSDOTAB
+    AS
+
+        --mschell! 20190517
+
+        kount           PLS_INTEGER := 0;
+        extractedrings  MDSYS.SDO_GEOMETRY_ARRAY := MDSYS.SDO_GEOMETRY_ARRAY();
+        somembrs        TILEREFRESH.MBRSDOTAB := TILEREFRESH.MBRSDOTAB();
+
+    BEGIN
+
+        extractedrings := SDO_UTIL.extract_all(p_geombucketdrop
+                                              ,0);
+                
+        FOR jj IN 1 .. extractedrings.COUNT 
+        LOOP
+
+            --SOP is just one ring, one loop
+            kount := kount + 1;
+            somembrs.EXTEND(1);
+
+            IF extractedrings(jj).get_gtype() <> 1
+            THEN
+
+                somembrs(kount).mbr := SDO_GEOM.sdo_mbr(
+                                                SDO_CS.transform(extractedrings(jj)
+                                                                ,p_srid)
+                                        );
+
+            ELSE
+
+                -- mbr of a point is a point, does not work for us
+                -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
+                -- make sure to bloat using input tolerance units
+                somembrs(kount).mbr := SDO_GEOM.sdo_mbr(
+                                                SDO_CS.transform(
+                                                       TILEREFRESH.mbrpoint(extractedrings(jj)
+                                                                           ,p_tolerance * 2)
+                                                                ,p_srid)
+                                                        );
+
+            END IF;
+                
+        END LOOP;
+
+        RETURN somembrs;
+
+    END DUMPDIFFADROP;
 
    FUNCTION DUMPDIFFSSDO (
       p_tab1            IN VARCHAR2
@@ -682,16 +771,12 @@ PROCEDURE ADD_SPATIAL_INDEX (
         psql1                   VARCHAR2(4000);
         psql2                   VARCHAR2(4000);
         psql3                   VARCHAR2(4000);
-        psql1a                  VARCHAR2(4000);
-        psql2a                  VARCHAR2(4000);
         fullsql                 VARCHAR2(8000);
-        my_cursor               SYS_REFCURSOR;
-        array_of_ringarrays     SDO_ARRAY_ARRAY := SDO_ARRAY_ARRAY();
-        --TYPE                    SDO_ARRAY_ARRAY IS TABLE OF MDSYS.SDO_GEOMETRY_ARRAY 
-        --                        INDEX BY PLS_INTEGER;
-        --array_of_ringarrays     SDO_ARRAY_ARRAY;
+        my_cursor1              SYS_REFCURSOR;
+        my_cursor2              SYS_REFCURSOR;
+        geombucket              MDSYS.SDO_GEOMETRY_ARRAY := MDSYS.SDO_GEOMETRY_ARRAY();
         somembrs                TILEREFRESH.MBRSDOTAB := TILEREFRESH.MBRSDOTAB();
-        verbose                 PLS_INTEGER := 1;
+        verbose                 PLS_INTEGER := 0;
         kount                   PLS_INTEGER := 0;
 
     BEGIN
@@ -707,22 +792,22 @@ PROCEDURE ADD_SPATIAL_INDEX (
 
         -- But its more important to bust up multipolygons and save cycles on
         -- the tile re-generation calls
-        -- I dont think I can work with mdsys.sdo_geometry_array from extract_all
-        -- in SQL, gotta pass the geoms back to the cursor then transform and mbr
+        -- I tried for a good day to deal with SDO_UTIL.extract_all in SQL
+        -- but the earth is boiling and time is so precious
 
         psql1 := 'SELECT '
-              || 'SDO_UTIL.extract_all(a.shape, :p1) '
+              || 'a.shape '
               || 'FROM '; --tablename a,
 
         psql2 := ' a, '
                 || 'TABLE( '
-                || '     SELECT GisLayer(:p2, :p3, :p4).Ldiff( '
-                || '            GisLayer(:p5, :p6, :p7)';
+                || '     SELECT GisLayer(:p1, :p2, :p3).Ldiff( '
+                || '            GisLayer(:p4, :p5, :p6)';
 
         IF p_cols IS NOT NULL
         THEN
 
-            psql2 := psql2 || ',:p8';
+            psql2 := psql2 || ',:p7';
 
         END IF;
 
@@ -732,123 +817,75 @@ PROCEDURE ADD_SPATIAL_INDEX (
                 || 't.COLUMN_VALUE = a.' || p_businesskey || ' AND '
                 || 'a.shape IS NOT NULL ';
 
-        psql1a := 'SELECT '
-              || 'SDO_UTIL.extract_all(a.shape, :p1a) '
-              || 'FROM '; --tablename a,
-
-        psql2a := ' a, '
-                || 'TABLE( '
-                || '     SELECT GisLayer(:p2a, :p3a, :p4a).Ldiff( '
-                || '            GisLayer(:p5a, :p6a, :p7a)';
-
-        IF p_cols IS NOT NULL
-        THEN
-
-            psql2a := psql2a || ',:p8a';
-
-        END IF;
-
-        fullsql := psql1 || p_tab2 || psql2 || psql3 || 
-                   'UNION ALL ' ||
-                   psql1a || p_tab1 || psql2a || psql3;
 
         IF verbose = 1
         THEN
             dbms_output.put_line (fullsql);
-            dbms_output.put_line('using');
-            dbms_output.put_line(0 || ',' || 
-                                 p_tab2 || ',' ||
-                                 p_synthkey || ',' || 
-                                 p_businesskey || ',' ||
-                                 p_tab1 || ',' || 
-                                 p_synthkey || ',' || 
-                                 p_businesskey || ',' ||
-                                 0 || ',' ||
-                                 p_tab1 || ',' || 
-                                 p_synthkey || ',' || 
-                                 p_businesskey || ',' ||
-                                 p_tab2 || ',' ||
-                                 p_synthkey || ',' ||
-                                 p_businesskey);        
+        --    dbms_output.put_line('using');
+        --    dbms_output.put_line(p_tab2 || ',' ||
+        --                         p_synthkey || ',' || 
+        --                         p_businesskey || ',' ||
+        --                         p_tab1 || ',' || 
+        --                         p_synthkey || ',' || 
+        --                         p_businesskey ||       
         END IF;
 
         IF p_cols IS NULL
         THEN
 
-            OPEN my_cursor FOR fullsql
-                         USING 0,
-                               p_tab2, p_synthkey, p_businesskey,
-                               p_tab1, p_synthkey, p_businesskey,
-                               0,
-                               p_tab1, p_synthkey, p_businesskey,
-                               p_tab2, p_synthkey, p_businesskey;
+            fullsql := psql1 || p_tab2 || psql2 || psql3;
+
+            my_cursor1 :=  DUMPDIFFSCUR(fullsql
+                                       ,p_tab2
+                                       ,p_tab1
+                                       ,p_synthkey
+                                       ,p_businesskey);
+
+            -- symmetric difference
+            fullsql := psql1 || p_tab1 || psql2 || psql3;
+
+            my_cursor2 :=  DUMPDIFFSCUR(fullsql
+                                       ,p_tab1
+                                       ,p_tab2
+                                       ,p_synthkey
+                                       ,p_businesskey);                           
 
         ELSE
+            
+            fullsql := psql1 || p_tab2 || psql2 || psql3;
 
-            OPEN my_cursor FOR fullsql
-                               USING 0,
-                               p_tab2, p_synthkey, p_businesskey,
-                               p_tab1, p_synthkey, p_businesskey,
-                               p_cols,
-                               0,
-                               p_tab1, p_synthkey, p_businesskey,
-                               p_tab2, p_synthkey, p_businesskey,
-                               p_cols;
+            my_cursor1 :=  DUMPDIFFSCUR(fullsql
+                                       ,p_tab2
+                                       ,p_tab1
+                                       ,p_synthkey
+                                       ,p_businesskey
+                                       ,p_cols);
+
+            fullsql := psql1 || p_tab1 || psql2 || psql3;
+
+            my_cursor2 :=  DUMPDIFFSCUR(fullsql
+                                       ,p_tab1
+                                       ,p_tab2
+                                       ,p_synthkey
+                                       ,p_businesskey
+                                       ,p_cols);                           
 
         END IF;
 
         LOOP
 
-            FETCH my_cursor BULK COLLECT INTO array_of_ringarrays LIMIT 25;
+            FETCH my_cursor1 BULK COLLECT INTO geombucket LIMIT 25;
 
-            EXIT WHEN array_of_ringarrays.COUNT = 0;
+            EXIT WHEN geombucket.COUNT = 0;
 
-            FOR i IN 1 .. array_of_ringarrays.COUNT
+            FOR i IN 1 .. geombucket.COUNT
             LOOP
 
-                FOR jj IN 1 .. array_of_ringarrays(i).COUNT 
-                LOOP
-
-                    kount := kount + 1;
-                    somembrs.EXTEND(1);
-
-                    IF array_of_ringarrays(i)(jj).sdo_gtype <> 2001
-                    THEN
-
-                        somembrs(kount).mbr := SDO_GEOM.sdo_mbr(
-                                                    SDO_CS.transform(array_of_ringarrays(i)(jj)
-                                                                    ,p_srid)
-                                               );
-
-                    ELSE
-
-                        -- mbr of a point is a point, does not work for us
-                        -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
-                        -- make sure to bloat using input tolerance units
-                        somembrs(kount).mbr := SDO_GEOM.sdo_mbr(
-                                                    SDO_CS.transform(
-                                                        MBRPOINT(array_of_ringarrays(i)(jj)
-                                                                ,p_tolerance * 2)
-                                                   ,p_srid)
-                                               );
-
-                    END IF;
-                
-                    IF somembrs(kount).mbr.get_gtype() = 1
-                    THEN
-
-                        -- mbr of a point is a point, does not work for us
-                        -- obvious fix: sdo_geom.sdo_mbr(sdo_geom.sdo_buffer) is too flakey with curves
-                        somembrs(kount).mbr := MBRPOINT(somembrs(kount).mbr
-                                                       ,p_tolerance * 2);
-
-                    END IF;
-
-                END LOOP;
+                somembrs :=  DUMPDIFFADROP(geombucket(i)
+                                          ,p_srid
+                                          ,p_tolerance); 
 
             END LOOP;
-
-            array_of_ringarrays.DELETE;
 
             FOR i IN 1 .. somembrs.COUNT
             LOOP
@@ -861,6 +898,37 @@ PROCEDURE ADD_SPATIAL_INDEX (
             somembrs.DELETE;
 
         END LOOP;
+
+        CLOSE my_cursor1;
+
+        LOOP
+
+            FETCH my_cursor2 BULK COLLECT INTO geombucket LIMIT 25;
+
+            EXIT WHEN geombucket.COUNT = 0;
+
+            FOR i IN 1 .. geombucket.COUNT
+            LOOP
+
+                somembrs :=  DUMPDIFFADROP(geombucket(i)
+                                          ,p_srid
+                                          ,p_tolerance); 
+
+            END LOOP;
+
+            FOR i IN 1 .. somembrs.COUNT
+            LOOP
+
+                -- pop off son, pop off
+                PIPE ROW(somembrs(i));
+
+            END LOOP;
+
+            somembrs.DELETE;
+
+        END LOOP;
+
+        CLOSE my_cursor2;
 
       RETURN;
 

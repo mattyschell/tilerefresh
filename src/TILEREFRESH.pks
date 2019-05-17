@@ -56,6 +56,11 @@ AS
       p_layer_name      IN VARCHAR2,
       p_tabname         IN VARCHAR2 DEFAULT 'TILEREFRESH_PARAMS'
    ) RETURN TILEREFRESH.TRPARAMS_REC;
+
+    FUNCTION MBRPOINT (
+         p_sdo           IN MDSYS.SDO_GEOMETRY
+        ,p_bloat         IN NUMBER
+    ) RETURN MDSYS.SDO_GEOMETRY;
    
    FUNCTION DUMPDIFFSSDO (
       p_tab1            IN VARCHAR2,
